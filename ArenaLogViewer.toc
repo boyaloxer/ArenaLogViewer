@@ -1,8 +1,8 @@
 ## Interface: 20506, 20505
 ## Title: Arena Log Viewer
-## Notes: Records arena matches via CLEU and shows WCL-style timelines in-game.
+## Notes: Live CLEU arena recorder + WCL-style in-game timeline (does not import disk combat logs).
 ## Author: boyaloxer
-## Version: 0.1.3
+## Version: 0.2.0
 ## SavedVariables: ArenaLogViewerDB
 
 Recorder.lua
