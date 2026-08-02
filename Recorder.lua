@@ -16,13 +16,12 @@ local TRACKED = {
   SPELL_AURA_APPLIED = "aura_apply", SPELL_AURA_REMOVED = "aura_remove",
   SPELL_AURA_REFRESH = "aura_refresh",
   SPELL_DAMAGE = "damage", SPELL_PERIODIC_DAMAGE = "damage", SWING_DAMAGE = "damage",
+  RANGE_DAMAGE = "damage",
   SPELL_HEAL = "heal", SPELL_PERIODIC_HEAL = "heal",
   SPELL_INTERRUPT = "interrupt", SPELL_DISPEL = "dispel",
   UNIT_DIED = "death",
 }
 
--- Same idea as Gladdy: instance type + active battlefield + arena opponents.
--- IsActiveBattlefieldArena() alone is FALSE in the waiting room / countdown.
 local function InArena()
   local _, instanceType = IsInInstance()
   if instanceType == "arena" then
@@ -37,12 +36,10 @@ local function InArena()
       return true
     end
   end
-  -- Battlefield status (skirmish / rated) while the match is active
   if type(GetMaxBattlefieldID) == "function" and type(GetBattlefieldStatus) == "function" then
     for i = 1, GetMaxBattlefieldID() do
       local status, mapName, _, _, _, teamSize = GetBattlefieldStatus(i)
       if status == "active" and teamSize and teamSize > 0 then
-        -- teamSize > 0 distinguishes arena from many BGs
         if instanceType == "arena" or instanceType == "pvp" then
           if mapName and (mapName:find("[Aa]rena") or mapName:find("Lordaeron")
               or mapName:find("Nagrand") or mapName:find("Blade")) then
@@ -93,47 +90,109 @@ local function isPlayerGUID(guid)
 end
 
 local function snapshotRoster()
-  local players = {}
-  if UnitExists("player") then
-    local _, class = UnitClass("player")
-    local guid = UnitGUID("player")
-    if guid then
-      players[guid] = { name = UnitName("player"), class = class, side = "friendly" }
-    end
+  local byGuid, list = {}, {}
+  local function add(unit, side)
+    if not UnitExists(unit) then return end
+    local guid = UnitGUID(unit)
+    if not guid or byGuid[guid] then return end
+    local _, class = UnitClass(unit)
+    local p = { guid = guid, name = UnitName(unit), class = class, side = side }
+    byGuid[guid] = p
+    table.insert(list, p)
   end
-  for i = 1, 4 do
-    local unit = "party" .. i
-    if UnitExists(unit) then
-      local _, class = UnitClass(unit)
-      local guid = UnitGUID(unit)
-      if guid then
-        players[guid] = { name = UnitName(unit), class = class, side = "friendly" }
+  add("player", "friendly")
+  for i = 1, 4 do add("party" .. i, "friendly") end
+  for i = 1, 5 do add("arena" .. i, "enemy") end
+  return byGuid, list
+end
+
+local function classLabel(classToken)
+  if not classToken then return "?" end
+  local map = {
+    WARRIOR = "Warrior", PALADIN = "Paladin", HUNTER = "Hunter", ROGUE = "Rogue",
+    PRIEST = "Priest", DEATHKNIGHT = "Death Knight", SHAMAN = "Shaman", MAGE = "Mage",
+    WARLOCK = "Warlock", MONK = "Monk", DRUID = "Druid", DEMONHUNTER = "Demon Hunter",
+  }
+  return map[classToken] or classToken
+end
+
+function NS.ClassLabel(classToken)
+  return classLabel(classToken)
+end
+
+function NS.PlayerList(match)
+  if not match then return {} end
+  if type(match.playerList) == "table" and #match.playerList > 0 then
+    return match.playerList
+  end
+  local list = {}
+  if type(match.players) == "table" then
+    for k, p in pairs(match.players) do
+      if type(p) == "table" and p.name then
+        if not p.guid and type(k) == "string" then p.guid = k end
+        table.insert(list, p)
       end
     end
   end
-  for i = 1, 5 do
-    local unit = "arena" .. i
-    if UnitExists(unit) then
-      local _, class = UnitClass(unit)
-      local guid = UnitGUID(unit)
-      if guid then
-        players[guid] = { name = UnitName(unit), class = class, side = "enemy" }
-      end
+  table.sort(list, function(a, b)
+    if a.side == b.side then return (a.name or "") < (b.name or "") end
+    return a.side == "friendly"
+  end)
+  return list
+end
+
+local function buildStats(match)
+  local dmg, heal = {}, {}
+  for _, ev in ipairs(match.events or {}) do
+    if ev.k == "damage" and ev.s and ev.amount then
+      dmg[ev.s] = (dmg[ev.s] or 0) + ev.amount
+    elseif ev.k == "heal" and ev.s and ev.amount then
+      heal[ev.s] = (heal[ev.s] or 0) + ev.amount
     end
   end
-  return players
+  local stats = {}
+  for _, p in ipairs(NS.PlayerList(match)) do
+    table.insert(stats, {
+      guid = p.guid, name = p.name,
+      damage = dmg[p.guid] or 0,
+      healing = heal[p.guid] or 0,
+    })
+  end
+  return stats
+end
+
+local function inferResult(match)
+  local enemyDead, friendDead = 0, 0
+  local byGuid = match.players or {}
+  for _, d in ipairs(match.deaths or {}) do
+    local p = (d.guid and byGuid[d.guid]) or nil
+    if not p then
+      for _, q in pairs(byGuid) do
+        if type(q) == "table" and q.name == d.name then p = q; break end
+      end
+    end
+    if p then
+      if p.side == "enemy" then enemyDead = enemyDead + 1
+      elseif p.side == "friendly" then friendDead = friendDead + 1 end
+    end
+  end
+  if enemyDead > friendDead then return "WIN" end
+  if friendDead > enemyDead then return "LOSS" end
+  return "unknown"
 end
 
 local function startMatch(reason)
   if recording then return end
   ArenaLogViewerDB = ArenaLogViewerDB or { matches = {} }
   ArenaLogViewerDB.matches = ArenaLogViewerDB.matches or {}
+  local byGuid, list = snapshotRoster()
   current = {
     map = GetZoneText() or "Arena",
-    startedAt = date("%Y-%m-%d %H:%M"),
+    startedAt = date("%H:%M"),
     startTime = GetTime(),
     events = {},
-    players = snapshotRoster(),
+    players = byGuid,
+    playerList = list,
     result = "unknown",
     deaths = {},
   }
@@ -141,7 +200,10 @@ local function startMatch(reason)
   print(PREFIX .. ": |cff88ff88recording|r " .. (current.map or "arena")
     .. (reason and (" |cffaaaaaa(" .. reason .. ")|r") or ""))
   local function resnap()
-    if current then current.players = snapshotRoster() end
+    if not current then return end
+    local g, l = snapshotRoster()
+    current.players = g
+    current.playerList = l
   end
   if C_Timer and C_Timer.After then
     C_Timer.After(2, resnap)
@@ -156,7 +218,8 @@ local function endMatch(reason)
   end
   recording = false
   current.durationMs = math.floor((GetTime() - current.startTime) * 1000)
-  -- Always leave at least an empty timeline so the UI can list the match
+  current.stats = buildStats(current)
+  current.result = inferResult(current)
   if type(NS.BuildTimeline) == "function" and current.events then
     local ok, timeline = pcall(NS.BuildTimeline, current)
     current.timeline = (ok and timeline) or {}
@@ -177,8 +240,9 @@ local function endMatch(reason)
   local n = #ArenaLogViewerDB.matches
   local secs = math.floor((current.durationMs or 0) / 1000)
   print(PREFIX .. ": |cff88ff88saved|r " .. (current.map or "?")
-    .. " (" .. secs .. "s, " .. eventCount .. " events) — " .. n
-    .. " match" .. (n == 1 and "" or "es") .. ". |cffffffff/alv|r to view"
+    .. " (" .. secs .. "s, " .. eventCount .. " events, " .. (current.result or "?")
+    .. ") — " .. n .. " match" .. (n == 1 and "" or "es")
+    .. ". |cffffffff/alv|r to view"
     .. (reason and (" |cffaaaaaa(" .. reason .. ")|r") or ""))
   current = nil
 end
@@ -192,39 +256,10 @@ local function SyncArena(reason)
   end
 end
 
--- Fake match so you can verify the UI without queueing
 function NS.InsertTestMatch()
-  ArenaLogViewerDB = ArenaLogViewerDB or { matches = {} }
-  ArenaLogViewerDB.matches = ArenaLogViewerDB.matches or {}
-  local now = GetTime()
-  local match = {
-    map = "Test Arena",
-    startedAt = date("%Y-%m-%d %H:%M"),
-    startTime = now,
-    durationMs = 45000,
-    players = snapshotRoster(),
-    result = "unknown",
-    deaths = {},
-    events = {
-      { t = 1000, k = "cast", s = UnitGUID("player"), sn = UnitName("player"),
-        d = UnitGUID("player"), dn = UnitName("player"), id = 5782, n = "Fear", sc = 32 },
-      { t = 1000, k = "aura_apply", s = UnitGUID("player"), sn = UnitName("player"),
-        d = UnitGUID("player"), dn = UnitName("player"), id = 5782, n = "Fear", sc = 32 },
-      { t = 9000, k = "aura_remove", s = UnitGUID("player"), sn = UnitName("player"),
-        d = UnitGUID("player"), dn = UnitName("player"), id = 5782, n = "Fear", sc = 32 },
-      { t = 12000, k = "cast", s = UnitGUID("player"), sn = UnitName("player"),
-        d = UnitGUID("player"), dn = UnitName("player"), id = 172, n = "Corruption", sc = 32 },
-      { t = 12000, k = "aura_apply", s = UnitGUID("player"), sn = UnitName("player"),
-        d = UnitGUID("player"), dn = UnitName("player"), id = 172, n = "Corruption", sc = 32 },
-      { t = 30000, k = "aura_remove", s = UnitGUID("player"), sn = UnitName("player"),
-        d = UnitGUID("player"), dn = UnitName("player"), id = 172, n = "Corruption", sc = 32 },
-    },
-  }
-  match.timeline = NS.BuildTimeline(match)
-  match.events = nil
-  table.insert(ArenaLogViewerDB.matches, match)
-  print(PREFIX .. ": inserted |cfffffffftest match|r — open |cffffffff/alv|r")
-  return match
+  if NS.LoadDemoMatches then
+    return NS.LoadDemoMatches()
+  end
 end
 
 local f = CreateFrame("Frame")
@@ -238,24 +273,37 @@ f:SetScript("OnEvent", function(_, event, ...)
       or event == "UPDATE_BATTLEFIELD_STATUS" then
     if C_Timer and C_Timer.After then
       C_Timer.After(0.25, function() SyncArena(event) end)
-      -- Second pass: waiting-room → gates sometimes flips instance flags late
       C_Timer.After(2.0, function() SyncArena(event .. "+2s") end)
     else
       SyncArena(event)
     end
   elseif event == "COMBAT_LOG_EVENT_UNFILTERED" and recording and current then
-    local _, sub, _, srcGUID, srcName, _, _, dstGUID, dstName, _, _,
-      spellId, spellName, school = CombatLogGetCurrentEventInfo()
+    local timestamp, sub, hideCaster, srcGUID, srcName, srcFlags, srcRaidFlags,
+      dstGUID, dstName, dstFlags, dstRaidFlags, arg12, arg13, arg14, arg15 =
+      CombatLogGetCurrentEventInfo()
     local kind = TRACKED[sub]
     if not kind then return end
     if not (isPlayerGUID(srcGUID) or isPlayerGUID(dstGUID)) then return end
     local t = math.floor((GetTime() - current.startTime) * 1000)
+    local spellId, spellName, school, amount
+    if sub == "SWING_DAMAGE" then
+      spellId, spellName, school = 0, "Melee", 1
+      amount = tonumber(arg12) or 0
+    elseif sub == "UNIT_DIED" then
+      spellId, spellName, school = nil, nil, nil
+    else
+      spellId, spellName, school = arg12, arg13, arg14
+      if kind == "damage" or kind == "heal" then
+        amount = tonumber(arg15) or 0
+      end
+    end
     table.insert(current.events, {
       t = t, k = kind, s = srcGUID, sn = srcName,
       d = dstGUID, dn = dstName, id = spellId, n = spellName, sc = school,
+      amount = amount,
     })
     if kind == "death" and isPlayerGUID(dstGUID) then
-      table.insert(current.deaths, { name = dstName, atMs = t })
+      table.insert(current.deaths, { name = dstName, guid = dstGUID, atMs = t })
     end
   end
 end)

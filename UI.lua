@@ -1,19 +1,26 @@
--- UI.lua — WCL-style match list + timeline (ported look from tbc-arena-logs web app).
--- Spell icons via GetSpellTexture. Minimap clock toggles the viewer.
+-- UI.lua — in-game viewer matching the Arena Log Viewer mockup:
+-- match cards, stats bar, aura pills, abbreviated timeline rows, export.
 
 local ADDON, NS = ...
-local PX_PER_SEC = 40          -- closer to the web app's ~52 default
+local PX_PER_SEC = 40
 local LABEL_W = 200
 local ROW_H = 22
 local SEG = 16
 local RULER_H = 28
+local SIDE_W = 250
 local PREFIX = "|cff66bbffArena Log Viewer|r"
-local ICON_TEX = "Interface\\Icons\\INV_Misc_PocketWatch_01"
+local ICON_TEX = "Interface\\Minimap\\Tracking\\None"
+local GOLD = { 0.9, 0.75, 0.2 }
 
 local main, miniBtn, db
-local selectedMatch
+local selectedMatch, selectedIndex
+local viewMode = "timeline" -- timeline | coordination
+local sourceFilter, targetFilter = "all", "any"
+local hiddenAuras = {}
 local segPool, poolIdx = {}, 0
-local rowPool = {}             -- { bg, icon, label, track }
+local rowPool = {}
+local pillPool = {}
+local cardPool = {}
 
 local function EnsureDB()
   ArenaLogViewerDB = ArenaLogViewerDB or {}
@@ -26,14 +33,54 @@ end
 
 local function fmt(ms)
   local s = (ms or 0) / 1000
+  return string.format("%d:%02d", math.floor(s / 60), math.floor(s % 60))
+end
+
+local function fmtPrecise(ms)
+  local s = (ms or 0) / 1000
   return string.format("%d:%04.1f", math.floor(s / 60), s % 60)
 end
 
 local function fmtRuler(sec)
   local m = math.floor(sec / 60)
   local r = sec - m * 60
-  if m > 0 then return string.format("%d:%04.1f", m, r) end
-  return string.format("%.0fs", r)
+  if m > 0 then return string.format("%d:%02d", m, math.floor(r)) end
+  return string.format("%d:%02d", 0, math.floor(r))
+end
+
+local function classColor(class)
+  local c = (CUSTOM_CLASS_COLORS or RAID_CLASS_COLORS) and (CUSTOM_CLASS_COLORS or RAID_CLASS_COLORS)[class]
+  if c then return c.r, c.g, c.b end
+  return 0.8, 0.8, 0.8
+end
+
+local function estimateSVKB()
+  local n = #(ArenaLogViewerDB.matches or {})
+  local bytes = 8 * 1024
+  for _, m in ipairs(ArenaLogViewerDB.matches or {}) do
+    bytes = bytes + 1200 + (#(m.timeline or {}) * 180)
+    for _, row in ipairs(m.timeline or {}) do
+      bytes = bytes + (#(row.segments or {}) * 40)
+    end
+  end
+  return math.max(1, math.floor(bytes / 1024)), n
+end
+
+local function shortMap(map)
+  if not map then return "Arena" end
+  map = map:gsub(" Arena$", "")
+  if #map > 14 then return string.sub(map, 1, 12) .. "…" end
+  return map
+end
+
+local function compLine(match, side)
+  local parts = {}
+  for _, p in ipairs(NS.PlayerList(match)) do
+    if p.side == side then
+      table.insert(parts, NS.ClassLabel(p.class) or p.name or "?")
+    end
+  end
+  return (#parts > 0) and table.concat(parts, " / ") or "—"
 end
 
 local function acquireSeg(parent)
@@ -74,9 +121,8 @@ local function ensureRow(content, i)
   row = {}
   row.bg = content:CreateTexture(nil, "BACKGROUND")
   row.bg:SetHeight(ROW_H)
-  row.icon = content:CreateTexture(nil, "ARTWORK")
-  row.icon:SetSize(SEG, SEG)
-  row.icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+  row.abbr = content:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+  row.abbr:SetJustifyH("LEFT")
   row.label = content:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
   row.label:SetJustifyH("LEFT")
   row.track = CreateFrame("Frame", nil, content)
@@ -89,22 +135,46 @@ local function hideExtraRows(fromIndex)
   for i = fromIndex, #rowPool do
     local row = rowPool[i]
     if row then
-      row.bg:Hide(); row.icon:Hide(); row.label:Hide(); row.track:Hide()
+      row.bg:Hide(); row.abbr:Hide(); row.label:Hide(); row.track:Hide()
     end
   end
 end
 
-local function clearRuler(content)
-  if content.rulerTicks then
-    for _, fs in ipairs(content.rulerTicks) do fs:Hide() end
+local function filteredRows(match)
+  if not match or type(match.timeline) ~= "table" then return {} end
+  local out = {}
+  for _, row in ipairs(match.timeline) do
+    if not hiddenAuras[row.key] then
+      if sourceFilter ~= "all" and row.sourceGuid ~= sourceFilter then
+        -- skip
+      else
+        local segs = row.segments
+        if targetFilter ~= "any" then
+          local filtered = {}
+          for _, s in ipairs(row.segments) do
+            if s.targetGuid == targetFilter then table.insert(filtered, s) end
+          end
+          if #filtered == 0 then segs = nil
+          else segs = filtered end
+        end
+        if segs then
+          if segs == row.segments then
+            table.insert(out, row)
+          else
+            table.insert(out, {
+              key = row.key, spellId = row.spellId, spellName = row.spellName,
+              school = row.school, sourceName = row.sourceName, sourceGuid = row.sourceGuid,
+              segments = segs,
+            })
+          end
+        end
+      end
+    end
   end
-  if content.rulerLines then
-    for _, tex in ipairs(content.rulerLines) do tex:Hide() end
-  end
+  return out
 end
 
-local function drawRuler(content, durationMs, pps, trackX)
-  clearRuler(content)
+local function drawRuler(content, durationMs, pps, trackX, rowCount)
   content.rulerTicks = content.rulerTicks or {}
   content.rulerLines = content.rulerLines or {}
   if not content.rulerAxis then
@@ -119,7 +189,7 @@ local function drawRuler(content, durationMs, pps, trackX)
   content.rulerAxis:SetSize(trackW, 1)
   content.rulerAxis:Show()
 
-  local majorEvery = (pps >= 48) and 1 or (pps >= 24) and 2 or 5
+  local majorEvery = (pps >= 48) and 5 or (pps >= 24) and 10 or 15
   local tickI, lineI = 0, 0
   for t = 0, dur + 0.001, majorEvery do
     tickI = tickI + 1
@@ -138,67 +208,60 @@ local function drawRuler(content, durationMs, pps, trackX)
     local line = content.rulerLines[lineI]
     if not line then
       line = content:CreateTexture(nil, "BACKGROUND")
-      line:SetColorTexture(0.22, 0.22, 0.25, 0.9)
+      line:SetColorTexture(0.22, 0.22, 0.25, 0.7)
       line:SetWidth(1)
       content.rulerLines[lineI] = line
     end
     line:ClearAllPoints()
     line:SetPoint("TOPLEFT", x, -RULER_H)
-    line:SetHeight(math.max(#(selectedMatch and selectedMatch.timeline or {}) * ROW_H, 40))
+    line:SetHeight(math.max(rowCount * ROW_H, 40))
     line:Show()
   end
-  for i = tickI + 1, #(content.rulerTicks or {}) do content.rulerTicks[i]:Hide() end
-  for i = lineI + 1, #(content.rulerLines or {}) do content.rulerLines[i]:Hide() end
+  for i = tickI + 1, #content.rulerTicks do content.rulerTicks[i]:Hide() end
+  for i = lineI + 1, #content.rulerLines do content.rulerLines[i]:Hide() end
+  return trackW
 end
 
-local function renderMatch(match, content, pps)
+local function renderTimeline(match, content, pps)
   releaseAllSegs()
-  selectedMatch = match
-  if not match or type(match.timeline) ~= "table" then
+  local rows = filteredRows(match)
+  if content.emptyTrack then content.emptyTrack:Hide() end
+  if #rows == 0 then
     hideExtraRows(1)
-    clearRuler(content)
     if content.emptyTrack then
-      content.emptyTrack:SetText("No timeline for this match.")
+      content.emptyTrack:SetText(viewMode == "coordination" and "" or "No rows for this filter.")
       content.emptyTrack:Show()
     end
+    content:SetSize(400, 80)
     return
   end
-  if content.emptyTrack then content.emptyTrack:Hide() end
 
   local trackX = LABEL_W + 8
-  local dur = math.max((match.durationMs or 0) / 1000, 1)
-  local trackW = dur * pps
-  drawRuler(content, match.durationMs, pps, trackX)
+  local trackW = drawRuler(content, match.durationMs, pps, trackX, #rows)
 
-  if main and main.header then
-    main.header:SetText(string.format("%s  ·  %s  ·  %d spells",
-      match.map or "Arena", fmt(match.durationMs), #match.timeline))
-  end
-
-  for i, rowData in ipairs(match.timeline) do
+  for i, rowData in ipairs(rows) do
     local y = -RULER_H - (i - 1) * ROW_H
     local row = ensureRow(content, i)
     local r, g, b = NS.SchoolColor(rowData.school)
     local tex = GetSpellTexture(rowData.spellId) or 134400
+    local abbr = NS.SpellAbbrev(rowData.spellName)
 
     row.bg:ClearAllPoints()
     row.bg:SetPoint("TOPLEFT", 0, y)
     row.bg:SetPoint("TOPRIGHT", content, "TOPRIGHT", 0, y)
-    if i % 2 == 0 then
-      row.bg:SetColorTexture(1, 1, 1, 0.03)
-    else
-      row.bg:SetColorTexture(0, 0, 0, 0.15)
-    end
+    row.bg:SetColorTexture(i % 2 == 0 and 1 or 0, i % 2 == 0 and 1 or 0, i % 2 == 0 and 1 or 0, i % 2 == 0 and 0.03 or 0.12)
     row.bg:Show()
 
-    row.icon:ClearAllPoints()
-    row.icon:SetPoint("TOPLEFT", 6, y - 3)
-    row.icon:SetTexture(tex)
-    row.icon:Show()
+    row.abbr:ClearAllPoints()
+    row.abbr:SetPoint("TOPLEFT", 6, y - 4)
+    row.abbr:SetWidth(28)
+    row.abbr:SetText(abbr)
+    row.abbr:SetTextColor(r, g, b)
+    row.abbr:Show()
 
     row.label:ClearAllPoints()
-    row.label:SetPoint("LEFT", row.icon, "RIGHT", 6, 0)
-    row.label:SetWidth(LABEL_W - 36)
+    row.label:SetPoint("LEFT", row.abbr, "RIGHT", 4, 0)
+    row.label:SetWidth(LABEL_W - 40)
     row.label:SetText(rowData.spellName or "?")
     row.label:SetTextColor(r, g, b)
     row.label:Show()
@@ -214,8 +277,9 @@ local function renderMatch(match, content, pps)
       f:ClearAllPoints()
       f:SetPoint("TOPLEFT", left, -3)
       f.tipTitle = rowData.spellName
-      f.tipBody = fmt(seg.startMs) .. " · " .. seg.kind
-        .. (seg.targetName and ("\n" .. (rowData.sourceName or "?") .. " → " .. seg.targetName) or "")
+      f.tipBody = fmtPrecise(seg.startMs) .. " · " .. seg.kind
+        .. "\n" .. (seg.sourceName or rowData.sourceName or "?")
+        .. " → " .. (seg.targetName or "?")
 
       if seg.kind == "cast" then
         f:SetSize(SEG, SEG)
@@ -240,67 +304,341 @@ local function renderMatch(match, content, pps)
       end
     end
   end
-  hideExtraRows(#match.timeline + 1)
-  content:SetSize(trackX + trackW + 40, RULER_H + #match.timeline * ROW_H + 20)
+  hideExtraRows(#rows + 1)
+  content:SetSize(trackX + trackW + 40, RULER_H + #rows * ROW_H + 20)
 end
 
-local function refreshSidebar(sideContent, content)
-  if sideContent.buttons then
-    for _, b in ipairs(sideContent.buttons) do b:Hide() end
-  end
-  sideContent.buttons = sideContent.buttons or {}
-  local matches = ArenaLogViewerDB.matches or {}
+local function renderCoordination(match, content)
+  releaseAllSegs()
+  hideExtraRows(1)
+  if content.rulerAxis then content.rulerAxis:Hide() end
+  if content.rulerTicks then for _, fs in ipairs(content.rulerTicks) do fs:Hide() end end
+  if content.rulerLines then for _, tex in ipairs(content.rulerLines) do tex:Hide() end end
 
-  if sideContent.note then sideContent.note:Hide() end
-
-  for i, m in ipairs(matches) do
-    local b = sideContent.buttons[i]
-    if not b then
-      b = CreateFrame("Button", nil, sideContent, "UIPanelButtonTemplate")
-      b:SetSize(200, 36)
-      sideContent.buttons[i] = b
+  local tgtGuid = targetFilter
+  if tgtGuid == "any" then
+    -- busiest enemy by damage taken (approx: most aura/cast targets that are enemy)
+    local counts = {}
+    for _, row in ipairs(match.timeline or {}) do
+      for _, seg in ipairs(row.segments or {}) do
+        if seg.targetGuid then
+          counts[seg.targetGuid] = (counts[seg.targetGuid] or 0) + 1
+        end
+      end
     end
-    b:SetPoint("TOPLEFT", 4, -(i - 1) * 40 - 4)
-    b:SetText(("%s\n|cffaaaaaa%s|r"):format(m.map or "Arena", fmt(m.durationMs or 0)))
-    -- UIPanelButtonTemplate may not wrap; use short single line
-    b:SetText(("%d. %s (%s)"):format(i, m.map or "?", fmt(m.durationMs or 0)))
+    local best, bestN = nil, 0
+    for _, p in ipairs(NS.PlayerList(match)) do
+      if p.side == "enemy" and (counts[p.guid] or 0) > bestN then
+        best, bestN = p.guid, counts[p.guid] or 0
+      end
+    end
+    tgtGuid = best
+  end
+
+  local lines = {}
+  local tgtName = "?"
+  for _, p in ipairs(NS.PlayerList(match)) do
+    if p.guid == tgtGuid then tgtName = p.name end
+  end
+  table.insert(lines, "Coordination — focus on " .. tgtName)
+  table.insert(lines, "")
+
+  local bySrc = {}
+  for _, st in ipairs(match.stats or {}) do
+    bySrc[st.guid] = st
+  end
+  for _, p in ipairs(NS.PlayerList(match)) do
+    if sourceFilter == "all" or sourceFilter == p.guid then
+      if p.side == "friendly" or p.guid == tgtGuid then
+        local st = bySrc[p.guid]
+        local dmg = st and st.damage or 0
+        table.insert(lines, string.format("%s  %s dmg", p.name, BreakUpLargeNumbers and BreakUpLargeNumbers(dmg) or dmg))
+      end
+    end
+  end
+  table.insert(lines, "")
+  table.insert(lines, "(Full focus-fire graph is on the web viewer.)")
+
+  if not content.coordText then
+    content.coordText = content:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+    content.coordText:SetJustifyH("LEFT")
+    content.coordText:SetPoint("TOPLEFT", 16, -16)
+    content.coordText:SetWidth(600)
+  end
+  content.coordText:SetText(table.concat(lines, "\n"))
+  content.coordText:Show()
+  if content.emptyTrack then content.emptyTrack:Hide() end
+  content:SetSize(640, 200)
+end
+
+local function updateStatsBar(match)
+  if not main or not main.statsBar then return end
+  local bar = main.statsBar
+  bar:SetText("")
+  if not match then return end
+  local bits = {}
+  local byGuid = {}
+  for _, p in ipairs(NS.PlayerList(match)) do byGuid[p.guid] = p end
+  for _, st in ipairs(match.stats or {}) do
+    local p = byGuid[st.guid]
+    local r, g, b = classColor(p and p.class)
+    local name = string.format("|cff%02x%02x%02x%s|r", r * 255, g * 255, b * 255, st.name or "?")
+    local dmg = BreakUpLargeNumbers and BreakUpLargeNumbers(st.damage or 0) or (st.damage or 0)
+    local heal = BreakUpLargeNumbers and BreakUpLargeNumbers(st.healing or 0) or (st.healing or 0)
+    table.insert(bits, name .. "  " .. dmg .. " dmg / " .. heal .. " heal")
+  end
+  if match.deaths and #match.deaths > 0 then
+    local dbits = {}
+    for _, d in ipairs(match.deaths) do
+      table.insert(dbits, string.format("%s @ %.1fs", d.name or "?", (d.atMs or 0) / 1000))
+    end
+    table.insert(bits, "|cffff6666Deaths: " .. table.concat(dbits, ", ") .. "|r")
+  end
+  bar:SetText(table.concat(bits, "   "))
+end
+
+local function updatePills(match)
+  if not main or not main.pillRow then return end
+  for _, b in ipairs(pillPool) do b:Hide() end
+  if not match or viewMode ~= "timeline" then return end
+
+  local seen, list = {}, {}
+  for _, row in ipairs(match.timeline or {}) do
+    local hasAura = false
+    for _, s in ipairs(row.segments or {}) do
+      if s.kind == "aura" then hasAura = true; break end
+    end
+    if hasAura and not seen[row.spellName] then
+      seen[row.spellName] = true
+      table.insert(list, row)
+    end
+  end
+
+  local x = 0
+  for i, row in ipairs(list) do
+    if i > 12 then break end
+    local b = pillPool[i]
+    if not b then
+      b = CreateFrame("Button", nil, main.pillRow, "BackdropTemplate")
+      b:SetSize(110, 20)
+      b:SetBackdrop({
+        bgFile = "Interface\\Buttons\\WHITE8X8",
+        edgeFile = "Interface\\Buttons\\WHITE8X8",
+        edgeSize = 1,
+      })
+      b.fs = b:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+      b.fs:SetPoint("CENTER")
+      b.fs:SetWidth(100)
+      pillPool[i] = b
+    end
+    local r, g, bl = NS.SchoolColor(row.school)
+    local off = hiddenAuras[row.key]
+    b:SetBackdropColor(r * 0.25, g * 0.25, bl * 0.25, off and 0.25 or 0.85)
+    b:SetBackdropBorderColor(r, g, bl, off and 0.3 or 0.9)
+    b.fs:SetText(row.spellName)
+    b.fs:SetTextColor(r, g, bl, off and 0.4 or 1)
+    b:ClearAllPoints()
+    b:SetPoint("LEFT", main.pillRow, "LEFT", x, 0)
     b:SetScript("OnClick", function()
-      renderMatch(m, content, db.pxPerSec or PX_PER_SEC)
+      if hiddenAuras[row.key] then hiddenAuras[row.key] = nil
+      else hiddenAuras[row.key] = true end
+      if selectedMatch then NS.RefreshViewer() end
     end)
     b:Show()
+    x = x + 114
   end
-  sideContent:SetHeight(math.max(#matches, 1) * 40 + 60)
+end
 
-  if #matches == 0 then
-    if not sideContent.emptyHint then
-      sideContent.emptyHint = sideContent:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-      sideContent.emptyHint:SetPoint("TOPLEFT", 8, -8)
-      sideContent.emptyHint:SetWidth(190)
-      sideContent.emptyHint:SetJustifyH("LEFT")
-    end
-    if NS.IsRecording and NS.IsRecording() then
-      sideContent.emptyHint:SetText("Recording this arena…\nLeave the match to save it.")
-    else
-      sideContent.emptyHint:SetText(
-        "No live matches yet.\n\n" ..
-        "|cffffffffDisk WoWCombatLog files|r are for the\n" ..
-        "web app (TBC Arena Logs), not this\n" ..
-        "window — Lua can't read those files.\n\n" ..
-        "Queue arenas to record here, or\n" ..
-        "|cffffffff/alv test|r for a sample.")
-    end
-    sideContent.emptyHint:Show()
-  else
-    if sideContent.emptyHint then sideContent.emptyHint:Hide() end
-    -- Auto-open newest match
-    renderMatch(matches[#matches], content, db.pxPerSec or PX_PER_SEC)
+local function cycleFilter(which)
+  if not selectedMatch then return end
+  local players = NS.PlayerList(selectedMatch)
+  local opts = { "all" }
+  if which == "target" then opts = { "any" } end
+  for _, p in ipairs(players) do table.insert(opts, p.guid) end
+  local cur = (which == "source") and sourceFilter or targetFilter
+  local idx = 1
+  for i, v in ipairs(opts) do if v == cur then idx = i; break end end
+  idx = idx + 1
+  if idx > #opts then idx = 1 end
+  if which == "source" then sourceFilter = opts[idx] else targetFilter = opts[idx] end
+  NS.RefreshViewer()
+end
+
+local function filterLabel(which)
+  if not selectedMatch then
+    return which == "source" and "Source: All players" or "Target: Any target"
   end
+  local val = which == "source" and sourceFilter or targetFilter
+  if val == "all" then return "Source: All players" end
+  if val == "any" then return "Target: Any target" end
+  for _, p in ipairs(NS.PlayerList(selectedMatch)) do
+    if p.guid == val then
+      return (which == "source" and "Source: " or "Target: ") .. p.name
+    end
+  end
+  return which == "source" and "Source: All players" or "Target: Any target"
+end
+
+local function selectMatch(match, index)
+  selectedMatch = match
+  selectedIndex = index
+  sourceFilter, targetFilter = "all", "any"
+  wipe(hiddenAuras)
+  NS.RefreshViewer()
+end
+
+function NS.RefreshViewer()
+  if not main or not main:IsShown() then return end
+  EnsureDB()
+  local matches = ArenaLogViewerDB.matches or {}
+  local kb, n = estimateSVKB()
+  if main.statusText then
+    main.statusText:SetText(string.format("%d matches saved  •  SavedVariables %d KB", n, kb))
+  end
+
+  -- Sidebar cards (newest first)
+  for _, c in ipairs(cardPool) do c:Hide() end
+  local y = -4
+  local displayI = 0
+  for rev = #matches, 1, -1 do
+    local i = rev
+    local m = matches[i]
+    displayI = displayI + 1
+    local card = cardPool[displayI]
+    if not card then
+      card = CreateFrame("Button", nil, main.sideContent, "BackdropTemplate")
+      card:SetSize(SIDE_W - 28, 72)
+      card:SetBackdrop({
+        bgFile = "Interface\\Buttons\\WHITE8X8",
+        edgeFile = "Interface\\Buttons\\WHITE8X8",
+        edgeSize = 1,
+      })
+      card.title = card:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+      card.title:SetPoint("TOPLEFT", 8, -8)
+      card.title:SetJustifyH("LEFT")
+      card.meta = card:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+      card.meta:SetPoint("TOPLEFT", 8, -26)
+      card.meta:SetWidth(SIDE_W - 44)
+      card.meta:SetJustifyH("LEFT")
+      cardPool[displayI] = card
+    end
+    local res = m.result or "unknown"
+    local resColor = (res == "WIN" and "|cff66ff66" or res == "LOSS" and "|cffff6666" or "|cffaaaaaa")
+    card.title:SetText(string.format("Match %d — %s (%s%s|r)", i, shortMap(m.map), resColor, res))
+    card.meta:SetText(string.format("%s  ·  %s\nUs: %s\nThem: %s",
+      m.startedAt or "?", fmt(m.durationMs),
+      compLine(m, "friendly"), compLine(m, "enemy")))
+    local active = (selectedMatch == m) or (not selectedMatch and i == #matches)
+    card:SetBackdropColor(0.08, 0.08, 0.09, 1)
+    if active then
+      card:SetBackdropBorderColor(GOLD[1], GOLD[2], GOLD[3], 1)
+    else
+      card:SetBackdropBorderColor(0.25, 0.25, 0.28, 1)
+    end
+    card:ClearAllPoints()
+    card:SetPoint("TOPLEFT", 4, y)
+    card:SetScript("OnClick", function() selectMatch(m, i) end)
+    card:Show()
+    y = y - 78
+  end
+  main.sideContent:SetHeight(math.max(120, displayI * 78 + 80))
+
+  if main.sideEmpty then
+    if #matches == 0 then
+      main.sideEmpty:SetText("No matches yet.\n\nQueue arenas to record live,\nor |cffffffff/alv test|r for the mockup sample.\n\nDisk WoWCombatLog files → web app.")
+      main.sideEmpty:Show()
+    else
+      main.sideEmpty:Hide()
+    end
+  end
+
+  if not selectedMatch and #matches > 0 then
+    selectedMatch = matches[#matches]
+    selectedIndex = #matches
+  end
+
+  local m = selectedMatch
+  if main.header then
+    if m then
+      local rows = filteredRows(m)
+      main.header:SetText(string.format("%s  ·  %s  ·  %d rows",
+        m.map or "Arena", fmtPrecise(m.durationMs), #rows))
+    else
+      main.header:SetText("")
+    end
+  end
+
+  if main.tabTimeline and main.tabCoord then
+    if viewMode == "timeline" then
+      main.tabTimeline:SetText("|cffffd100Timeline|r")
+      main.tabCoord:SetText("|cffaaaaaaCoordination|r")
+    else
+      main.tabTimeline:SetText("|cffaaaaaaTimeline|r")
+      main.tabCoord:SetText("|cffffd100Coordination|r")
+    end
+  end
+  if main.sourceBtn then main.sourceBtn:SetText(filterLabel("source")) end
+  if main.targetBtn then main.targetBtn:SetText(filterLabel("target")) end
+  if main.zoomLabel then
+    main.zoomLabel:SetText(string.format("Zoom %d", db.pxPerSec or PX_PER_SEC))
+  end
+
+  updateStatsBar(m)
+  updatePills(m)
+
+  if main.content and main.content.coordText then main.content.coordText:Hide() end
+  if m then
+    if viewMode == "coordination" then
+      renderCoordination(m, main.content)
+    else
+      renderTimeline(m, main.content, db.pxPerSec or PX_PER_SEC)
+    end
+  else
+    releaseAllSegs()
+    hideExtraRows(1)
+  end
+end
+
+local function showExport()
+  if not selectedMatch then
+    print(PREFIX .. ": select a match first")
+    return
+  end
+  if not main.exportBox then return end
+  local m = selectedMatch
+  local lines = {
+    "ALV1",
+    "map=" .. tostring(m.map),
+    "at=" .. tostring(m.startedAt),
+    "dur=" .. tostring(m.durationMs),
+    "result=" .. tostring(m.result),
+  }
+  for _, p in ipairs(NS.PlayerList(m)) do
+    table.insert(lines, string.format("P|%s|%s|%s|%s", p.guid or "", p.name or "", p.class or "", p.side or ""))
+  end
+  for _, st in ipairs(m.stats or {}) do
+    table.insert(lines, string.format("S|%s|%d|%d", st.guid or "", st.damage or 0, st.healing or 0))
+  end
+  for _, row in ipairs(m.timeline or {}) do
+    for _, seg in ipairs(row.segments or {}) do
+      table.insert(lines, string.format("E|%s|%d|%s|%d|%s|%s|%s",
+        row.spellName or "?", row.spellId or 0, seg.kind,
+        seg.startMs or 0, tostring(seg.endMs or ""),
+        seg.sourceName or "", seg.targetName or ""))
+    end
+  end
+  local text = table.concat(lines, "\n")
+  main.exportBox:SetText(text)
+  main.exportFrame:Show()
+  main.exportBox:HighlightText()
+  main.exportBox:SetFocus()
+  print(PREFIX .. ": export string ready — Ctrl+C in the box, paste into the web viewer later")
 end
 
 local function buildMain()
   EnsureDB()
   main = CreateFrame("Frame", "ArenaLogViewerFrame", UIParent, "BackdropTemplate")
-  main:SetSize(1100, 640)
+  main:SetSize(1180, 700)
   main:SetPoint("CENTER")
   main:SetMovable(true)
   main:EnableMouse(true)
@@ -311,91 +649,200 @@ local function buildMain()
   main:SetClampedToScreen(true)
   main:SetBackdrop({
     bgFile = "Interface\\Buttons\\WHITE8X8",
-    edgeFile = "Interface\\Buttons\\WHITE8X8",
-    edgeSize = 1,
+    edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+    edgeSize = 24,
+    insets = { left = 6, right = 6, top = 6, bottom = 6 },
   })
-  main:SetBackdropColor(0.02, 0.02, 0.02, 0.97)
-  main:SetBackdropBorderColor(0.15, 0.15, 0.18, 1)
+  main:SetBackdropColor(0.04, 0.04, 0.045, 0.98)
   main:Hide()
 
   local title = main:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
-  title:SetPoint("TOPLEFT", 14, -12)
+  title:SetPoint("TOPLEFT", 18, -14)
   title:SetText("Arena Log Viewer")
-  title:SetTextColor(0.9, 0.9, 0.95)
+  title:SetTextColor(GOLD[1], GOLD[2], GOLD[3])
 
-  local header = main:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-  header:SetPoint("LEFT", title, "RIGHT", 16, 0)
-  header:SetTextColor(0.65, 0.7, 0.75)
-  main.header = header
+  local status = main:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+  status:SetPoint("TOPRIGHT", -40, -16)
+  main.statusText = status
 
   local close = CreateFrame("Button", nil, main, "UIPanelCloseButton")
-  close:SetPoint("TOPRIGHT", 2, 2)
+  close:SetPoint("TOPRIGHT", -4, -4)
 
   -- Sidebar
   local sideBg = CreateFrame("Frame", nil, main, "BackdropTemplate")
-  sideBg:SetPoint("TOPLEFT", 10, -36)
-  sideBg:SetSize(220, 590)
+  sideBg:SetPoint("TOPLEFT", 14, -40)
+  sideBg:SetPoint("BOTTOMLEFT", 14, 48)
+  sideBg:SetWidth(SIDE_W)
   sideBg:SetBackdrop({
     bgFile = "Interface\\Buttons\\WHITE8X8",
     edgeFile = "Interface\\Buttons\\WHITE8X8",
     edgeSize = 1,
   })
-  sideBg:SetBackdropColor(0.04, 0.04, 0.045, 1)
-  sideBg:SetBackdropBorderColor(0.12, 0.12, 0.14, 1)
+  sideBg:SetBackdropColor(0.05, 0.05, 0.055, 1)
+  sideBg:SetBackdropBorderColor(0.2, 0.18, 0.1, 1)
+
+  local sideTitle = sideBg:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+  sideTitle:SetPoint("TOPLEFT", 10, -8)
+  sideTitle:SetText("MATCHES")
+  sideTitle:SetTextColor(0.7, 0.7, 0.7)
 
   local side = CreateFrame("ScrollFrame", nil, sideBg, "UIPanelScrollFrameTemplate")
-  side:SetPoint("TOPLEFT", 4, -4)
-  side:SetPoint("BOTTOMRIGHT", -26, 4)
+  side:SetPoint("TOPLEFT", 4, -24)
+  side:SetPoint("BOTTOMRIGHT", -26, 44)
   local sideContent = CreateFrame("Frame", nil, side)
-  sideContent:SetSize(190, 10)
+  sideContent:SetSize(SIDE_W - 30, 10)
   side:SetScrollChild(sideContent)
   main.sideContent = sideContent
 
-  -- Timeline pane
+  main.sideEmpty = sideContent:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+  main.sideEmpty:SetPoint("TOPLEFT", 8, -8)
+  main.sideEmpty:SetWidth(SIDE_W - 48)
+  main.sideEmpty:SetJustifyH("LEFT")
+  main.sideEmpty:Hide()
+
+  local exportBtn = CreateFrame("Button", nil, sideBg, "UIPanelButtonTemplate")
+  exportBtn:SetSize(SIDE_W - 24, 32)
+  exportBtn:SetPoint("BOTTOM", 0, 8)
+  exportBtn:SetText("Export match string")
+  exportBtn:SetScript("OnClick", showExport)
+  local exportHint = sideBg:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+  exportHint:SetPoint("BOTTOM", exportBtn, "TOP", 0, 2)
+  exportHint:SetText("copy into the web viewer")
+
+  -- Main pane
   local paneBg = CreateFrame("Frame", nil, main, "BackdropTemplate")
-  paneBg:SetPoint("TOPLEFT", 238, -36)
-  paneBg:SetPoint("BOTTOMRIGHT", -10, 14)
+  paneBg:SetPoint("TOPLEFT", 14 + SIDE_W + 8, -40)
+  paneBg:SetPoint("BOTTOMRIGHT", -14, 48)
   paneBg:SetBackdrop({
     bgFile = "Interface\\Buttons\\WHITE8X8",
     edgeFile = "Interface\\Buttons\\WHITE8X8",
     edgeSize = 1,
   })
   paneBg:SetBackdropColor(0, 0, 0, 1)
-  paneBg:SetBackdropBorderColor(0.12, 0.12, 0.14, 1)
+  paneBg:SetBackdropBorderColor(0.2, 0.18, 0.1, 1)
+
+  local header = paneBg:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+  header:SetPoint("TOPLEFT", 10, -8)
+  header:SetTextColor(0.75, 0.75, 0.8)
+  main.header = header
+
+  local tabTimeline = CreateFrame("Button", nil, paneBg)
+  tabTimeline:SetSize(80, 18)
+  tabTimeline:SetPoint("TOPLEFT", 10, -28)
+  tabTimeline:SetNormalFontObject(GameFontNormal)
+  tabTimeline:SetText("Timeline")
+  tabTimeline:SetScript("OnClick", function()
+    viewMode = "timeline"; NS.RefreshViewer()
+  end)
+  main.tabTimeline = tabTimeline
+
+  local tabCoord = CreateFrame("Button", nil, paneBg)
+  tabCoord:SetSize(100, 18)
+  tabCoord:SetPoint("LEFT", tabTimeline, "RIGHT", 8, 0)
+  tabCoord:SetNormalFontObject(GameFontNormal)
+  tabCoord:SetText("Coordination")
+  tabCoord:SetScript("OnClick", function()
+    viewMode = "coordination"; NS.RefreshViewer()
+  end)
+  main.tabCoord = tabCoord
+
+  local sourceBtn = CreateFrame("Button", nil, paneBg, "UIPanelButtonTemplate")
+  sourceBtn:SetSize(140, 20)
+  sourceBtn:SetPoint("LEFT", tabCoord, "RIGHT", 16, 0)
+  sourceBtn:SetText("Source: All players")
+  sourceBtn:SetScript("OnClick", function() cycleFilter("source") end)
+  main.sourceBtn = sourceBtn
+
+  local targetBtn = CreateFrame("Button", nil, paneBg, "UIPanelButtonTemplate")
+  targetBtn:SetSize(140, 20)
+  targetBtn:SetPoint("LEFT", sourceBtn, "RIGHT", 6, 0)
+  targetBtn:SetText("Target: Any target")
+  targetBtn:SetScript("OnClick", function() cycleFilter("target") end)
+  main.targetBtn = targetBtn
+
+  local zoomOut = CreateFrame("Button", nil, paneBg, "UIPanelButtonTemplate")
+  zoomOut:SetSize(24, 20)
+  zoomOut:SetPoint("LEFT", targetBtn, "RIGHT", 10, 0)
+  zoomOut:SetText("-")
+  zoomOut:SetScript("OnClick", function()
+    db.pxPerSec = math.max(12, (db.pxPerSec or PX_PER_SEC) - 8)
+    NS.RefreshViewer()
+  end)
+  local zoomIn = CreateFrame("Button", nil, paneBg, "UIPanelButtonTemplate")
+  zoomIn:SetSize(24, 20)
+  zoomIn:SetPoint("LEFT", zoomOut, "RIGHT", 2, 0)
+  zoomIn:SetText("+")
+  zoomIn:SetScript("OnClick", function()
+    db.pxPerSec = math.min(80, (db.pxPerSec or PX_PER_SEC) + 8)
+    NS.RefreshViewer()
+  end)
+  local zoomLabel = paneBg:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+  zoomLabel:SetPoint("LEFT", zoomIn, "RIGHT", 6, 0)
+  main.zoomLabel = zoomLabel
+
+  local statsBar = paneBg:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+  statsBar:SetPoint("TOPLEFT", 10, -52)
+  statsBar:SetPoint("TOPRIGHT", -10, -52)
+  statsBar:SetJustifyH("LEFT")
+  statsBar:SetWordWrap(true)
+  main.statsBar = statsBar
+
+  local pillRow = CreateFrame("Frame", nil, paneBg)
+  pillRow:SetPoint("TOPLEFT", 10, -78)
+  pillRow:SetSize(800, 22)
+  main.pillRow = pillRow
 
   local pane = CreateFrame("ScrollFrame", nil, paneBg, "UIPanelScrollFrameTemplate")
-  pane:SetPoint("TOPLEFT", 6, -6)
-  pane:SetPoint("BOTTOMRIGHT", -28, 6)
+  pane:SetPoint("TOPLEFT", 6, -108)
+  pane:SetPoint("BOTTOMRIGHT", -28, 8)
   local content = CreateFrame("Frame", nil, pane)
   content:SetSize(100, 100)
   pane:SetScrollChild(content)
   main.content = content
-
   content.emptyTrack = content:CreateFontString(nil, "OVERLAY", "GameFontDisable")
   content.emptyTrack:SetPoint("TOPLEFT", 20, -40)
   content.emptyTrack:Hide()
 
-  -- Zoom buttons
-  local zoomOut = CreateFrame("Button", nil, main, "UIPanelButtonTemplate")
-  zoomOut:SetSize(28, 22)
-  zoomOut:SetPoint("TOPRIGHT", -40, -8)
-  zoomOut:SetText("-")
-  zoomOut:SetScript("OnClick", function()
-    db.pxPerSec = math.max(12, (db.pxPerSec or PX_PER_SEC) - 8)
-    if selectedMatch then renderMatch(selectedMatch, content, db.pxPerSec) end
-  end)
-  local zoomIn = CreateFrame("Button", nil, main, "UIPanelButtonTemplate")
-  zoomIn:SetSize(28, 22)
-  zoomIn:SetPoint("RIGHT", zoomOut, "LEFT", -4, 0)
-  zoomIn:SetText("+")
-  zoomIn:SetScript("OnClick", function()
-    db.pxPerSec = math.min(80, (db.pxPerSec or PX_PER_SEC) + 8)
-    if selectedMatch then renderMatch(selectedMatch, content, db.pxPerSec) end
-  end)
+  local footerL = main:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+  footerL:SetPoint("BOTTOMLEFT", 18, 18)
+  footerL:SetText("Hover a bar → GameTooltip shows time • kind • source → target")
+
+  local footerR = main:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+  footerR:SetPoint("BOTTOMRIGHT", -18, 18)
+  footerR:SetText("/alv to toggle  •  drag title bar to move")
+
+  -- Export overlay
+  local exportFrame = CreateFrame("Frame", nil, main, "BackdropTemplate")
+  exportFrame:SetPoint("CENTER")
+  exportFrame:SetSize(520, 280)
+  exportFrame:SetFrameStrata("FULLSCREEN_DIALOG")
+  exportFrame:SetBackdrop({
+    bgFile = "Interface\\Buttons\\WHITE8X8",
+    edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+    edgeSize = 24,
+    insets = { left = 6, right = 6, top = 6, bottom = 6 },
+  })
+  exportFrame:SetBackdropColor(0.05, 0.05, 0.05, 1)
+  exportFrame:Hide()
+  main.exportFrame = exportFrame
+  local exTitle = exportFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+  exTitle:SetPoint("TOP", 0, -16)
+  exTitle:SetText("Export match string — Ctrl+C to copy")
+  local exClose = CreateFrame("Button", nil, exportFrame, "UIPanelCloseButton")
+  exClose:SetPoint("TOPRIGHT", -4, -4)
+  local eb = CreateFrame("EditBox", nil, exportFrame)
+  eb:SetMultiLine(true)
+  eb:SetFontObject(GameFontHighlightSmall)
+  eb:SetPoint("TOPLEFT", 20, -40)
+  eb:SetPoint("BOTTOMRIGHT", -20, 20)
+  eb:SetAutoFocus(false)
+  eb:SetScript("OnEscapePressed", function() exportFrame:Hide() end)
+  main.exportBox = eb
 
   main:SetScript("OnShow", function()
     EnsureDB()
-    refreshSidebar(sideContent, content)
+    selectedMatch = nil
+    NS.RefreshViewer()
   end)
 end
 
@@ -405,9 +852,6 @@ local function ToggleViewer()
   main:SetShown(not main:IsShown())
 end
 
--- =====================================================================
--- Minimap button
--- =====================================================================
 local function UpdateMinimapPosition()
   if not miniBtn or not db then return end
   local angle = math.rad(db.minimapAngle or 200)
@@ -418,7 +862,6 @@ end
 local function EnsureMinimapButton()
   if miniBtn then return miniBtn end
   EnsureDB()
-
   local btn = CreateFrame("Button", "ArenaLogViewerMinimapButton", Minimap)
   btn:SetSize(32, 32)
   btn:SetFrameStrata("MEDIUM")
@@ -431,18 +874,15 @@ local function EnsureMinimapButton()
   overlay:SetSize(53, 53)
   overlay:SetTexture("Interface\\Minimap\\MiniMap-TrackingBorder")
   overlay:SetPoint("TOPLEFT")
-
   local bg = btn:CreateTexture(nil, "BACKGROUND")
   bg:SetSize(20, 20)
   bg:SetTexture("Interface\\Minimap\\UI-Minimap-Background")
   bg:SetPoint("TOPLEFT", 6, -6)
-
   local icon = btn:CreateTexture(nil, "ARTWORK")
   icon:SetSize(18, 18)
-  icon:SetTexture(ICON_TEX)
+  icon:SetTexture("Interface\\Icons\\INV_Misc_PocketWatch_01")
   icon:SetPoint("TOPLEFT", 7, -7)
   icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
-  btn.icon = icon
 
   btn:SetScript("OnClick", function(_, button)
     if button == "RightButton" then
@@ -465,14 +905,9 @@ local function EnsureMinimapButton()
   btn:SetScript("OnDragStop", function(self) self:SetScript("OnUpdate", nil) end)
   btn:SetScript("OnEnter", function(self)
     GameTooltip:SetOwner(self, "ANCHOR_LEFT")
-    GameTooltip:AddLine("Arena Log Viewer", 0.4, 0.75, 1)
+    GameTooltip:AddLine("Arena Log Viewer", GOLD[1], GOLD[2], GOLD[3])
     GameTooltip:AddLine(("Saved matches: |cffffffff%d|r"):format(NS.MatchCount and NS.MatchCount() or 0), 1, 1, 1)
-    if NS.IsRecording and NS.IsRecording() then
-      GameTooltip:AddLine("Status: |cff88ff88RECORDING|r", 1, 1, 1)
-    else
-      GameTooltip:AddLine("Live recorder (not disk combat logs)", 0.7, 0.7, 0.7)
-    end
-    GameTooltip:AddLine("Left-click: open  ·  /alv test for sample", 0.75, 0.75, 0.75)
+    GameTooltip:AddLine("Left-click: open  ·  /alv test = mockup sample", 0.75, 0.75, 0.75)
     GameTooltip:Show()
   end)
   btn:SetScript("OnLeave", GameTooltip_Hide)
@@ -494,10 +929,12 @@ SlashCmdList.ARENALOGVIEWER = function(msg)
     print(PREFIX .. ": minimap " .. (db.minimapHide and "hidden" or "shown"))
   elseif msg == "status" or msg == "debug" then
     if NS.DebugStatus then NS.DebugStatus() end
-  elseif msg == "test" then
-    if NS.InsertTestMatch then NS.InsertTestMatch() end
+  elseif msg == "test" or msg == "demo" then
+    if NS.LoadDemoMatches then NS.LoadDemoMatches() end
     if not main then buildMain() end
+    selectedMatch = nil
     main:Show()
+    NS.RefreshViewer()
   else
     ToggleViewer()
   end
@@ -508,7 +945,5 @@ boot:RegisterEvent("PLAYER_LOGIN")
 boot:SetScript("OnEvent", function()
   EnsureDB()
   EnsureMinimapButton()
-  print(PREFIX .. " ready — |cffffffff/alv|r ("
-    .. (NS.MatchCount and NS.MatchCount() or 0)
-    .. " live). Disk logs → web app. |cffffffff/alv test|r = sample.")
+  print(PREFIX .. " ready — |cffffffff/alv|r  ·  |cffffffff/alv test|r = mockup sample  ·  disk logs → web app")
 end)

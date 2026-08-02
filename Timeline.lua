@@ -3,6 +3,18 @@
 
 local ADDON, NS = ...
 
+-- "Shadow Word: Pain" -> "SW", "Mortal Strike" -> "MS"
+function NS.SpellAbbrev(name)
+  if not name or name == "" then return "?" end
+  local parts = {}
+  for word in string.gmatch(name, "[%a']+") do
+    table.insert(parts, word)
+  end
+  if #parts == 0 then return string.sub(name, 1, 2) end
+  if #parts == 1 then return string.upper(string.sub(parts[1], 1, 2)) end
+  return string.upper(string.sub(parts[1], 1, 1) .. string.sub(parts[2], 1, 1))
+end
+
 -- WoW spell school bitmask -> bar color (mirrors schoolColor.ts)
 NS.SchoolColor = function(school)
   if not school then return 0.6, 0.6, 0.65 end
@@ -23,7 +35,8 @@ function NS.BuildTimeline(match)
     local r = rows[key]
     if not r then
       r = { key = key, spellId = ev.id, spellName = ev.n or "Melee",
-            school = ev.sc, sourceName = ev.sn or "?", segments = {} }
+            school = ev.sc, sourceName = ev.sn or "?", sourceGuid = ev.s,
+            segments = {} }
       rows[key] = r; table.insert(order, r)
     end
     return r
@@ -34,14 +47,15 @@ function NS.BuildTimeline(match)
     if ev.k == "cast" then
       local r = rowFor(ev)
       table.insert(r.segments, { startMs = ev.t, endMs = nil, kind = "cast",
-        targetName = ev.dn })
+        sourceGuid = ev.s, sourceName = ev.sn, targetGuid = ev.d, targetName = ev.dn })
     elseif ev.k == "aura_apply" or ev.k == "aura_refresh" then
       local r = rowFor(ev)
       local ak = r.key .. "@" .. (ev.d or "")
       if ev.k == "aura_refresh" and openAuras[ak] then
         openAuras[ak].endMs = ev.t -- close and reopen on refresh
       end
-      local seg = { startMs = ev.t, endMs = nil, kind = "aura", targetName = ev.dn }
+      local seg = { startMs = ev.t, endMs = nil, kind = "aura",
+        sourceGuid = ev.s, sourceName = ev.sn, targetGuid = ev.d, targetName = ev.dn }
       table.insert(r.segments, seg)
       openAuras[ak] = seg
     elseif ev.k == "aura_remove" then
