@@ -122,7 +122,7 @@ local function refreshSidebar(sideContent, content)
     if NS.IsRecording and NS.IsRecording() then
       sideContent.emptyHint:SetText("Recording this arena now.\nLeave the match to save it here.")
     else
-      sideContent.emptyHint:SetText("No matches yet.\nQueue an arena — you'll see\n\"recording\" in chat when it starts.")
+      sideContent.emptyHint:SetText("No matches yet.\nThis does NOT import disk combat logs —\nit only saves arenas it records live.\n\n/alv test  = fake match to try the UI\n/alv status = debug detection")
     end
     sideContent.emptyHint:Show()
   elseif sideContent.emptyHint then
@@ -281,6 +281,14 @@ SlashCmdList.ARENALOGVIEWER = function(msg)
     end
     print(PREFIX .. ": minimap button " .. (db.minimapHide and "hidden" or "shown"))
     return
+  elseif msg == "status" or msg == "debug" then
+    if NS.DebugStatus then NS.DebugStatus() end
+    return
+  elseif msg == "test" then
+    if NS.InsertTestMatch then NS.InsertTestMatch() end
+    if not main then buildMain() end
+    main:Show() -- OnShow refreshes sidebar
+    return
   end
   ToggleViewer()
 end
@@ -290,5 +298,7 @@ boot:RegisterEvent("PLAYER_LOGIN")
 boot:SetScript("OnEvent", function()
   EnsureDB()
   EnsureMinimapButton()
-  print(PREFIX .. " ready — click the |cffffffffminimap clock icon|r or type |cffffffff/alv|r.")
+  local n = NS.MatchCount and NS.MatchCount() or 0
+  print(PREFIX .. " ready — clock icon or |cffffffff/alv|r ("
+    .. n .. " saved). |cffffffff/alv test|r = fake match, |cffffffff/alv status|r = debug.")
 end)
