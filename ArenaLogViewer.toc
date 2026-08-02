@@ -2,7 +2,7 @@
 ## Title: Arena Log Viewer
 ## Notes: Records arena matches via CLEU and shows WCL-style timelines in-game.
 ## Author: boyaloxer
-## Version: 0.1.0
+## Version: 0.1.1
 ## SavedVariables: ArenaLogViewerDB
 
 Recorder.lua

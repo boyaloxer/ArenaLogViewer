@@ -17,7 +17,7 @@ Records arena matches live via `COMBAT_LOG_EVENT_UNFILTERED` (no file I/O in the
 1. Copy the `ArenaLogViewer` folder into `Interface\AddOns\`
 2. Enable **Arena Log Viewer** at the character select screen
 3. Queue arenas — matches are saved automatically
-4. Type `/alv` to open the viewer
+4. Click the **minimap clock icon**, or type `/alv`, to open the viewer
 
 ## Related
 
@@ -31,6 +31,7 @@ This addon is the in-game counterpart: same timeline idea, recorded live instead
 | Command | Action |
 |---------|--------|
 | `/alv` | Toggle the viewer window |
+| `/alv minimap` | Show / hide the minimap button |
 
 ## License
 
