@@ -119,7 +119,11 @@ local function refreshSidebar(sideContent, content)
       sideContent.emptyHint:SetWidth(180)
       sideContent.emptyHint:SetJustifyH("LEFT")
     end
-    sideContent.emptyHint:SetText("No matches yet.\nPlay an arena — recording starts automatically.")
+    if NS.IsRecording and NS.IsRecording() then
+      sideContent.emptyHint:SetText("Recording this arena now.\nLeave the match to save it here.")
+    else
+      sideContent.emptyHint:SetText("No matches yet.\nQueue an arena — you'll see\n\"recording\" in chat when it starts.")
+    end
     sideContent.emptyHint:Show()
   elseif sideContent.emptyHint then
     sideContent.emptyHint:Hide()
@@ -234,8 +238,15 @@ local function EnsureMinimapButton()
     GameTooltip:SetOwner(self, "ANCHOR_LEFT")
     GameTooltip:ClearLines()
     GameTooltip:AddLine("Arena Log Viewer", 0.4, 0.75, 1)
-    local n = #(ArenaLogViewerDB.matches or {})
+    local n = NS.MatchCount and NS.MatchCount() or #(ArenaLogViewerDB.matches or {})
     GameTooltip:AddLine(("Saved matches: |cffffffff%d|r"):format(n), 1, 1, 1)
+    if NS.IsRecording and NS.IsRecording() then
+      GameTooltip:AddLine("Status: |cff88ff88RECORDING|r", 1, 1, 1)
+      btn.icon:SetVertexColor(0.45, 1, 0.55)
+    else
+      GameTooltip:AddLine("Status: idle (queue an arena)", 0.75, 0.75, 0.75)
+      btn.icon:SetVertexColor(1, 1, 1)
+    end
     GameTooltip:AddLine(" ")
     GameTooltip:AddLine("|cffaaaaaaLeft-click:|r open / close viewer", 0.8, 0.8, 0.8)
     GameTooltip:AddLine("|cffaaaaaaRight-click:|r hide this button", 0.8, 0.8, 0.8)
