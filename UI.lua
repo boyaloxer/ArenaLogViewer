@@ -942,9 +942,10 @@ local function buildMain()
   end
   local hUp = hScroll.ScrollUpButton or _G["ArenaLogViewerHScrollScrollUpButton"]
   local hDown = hScroll.ScrollDownButton or _G["ArenaLogViewerHScrollScrollDownButton"]
-  -- ScrollUp decreases value → left; ScrollDown increases → right
+  -- ScrollUp decreases value → left; ScrollDown increases → right.
+  -- Up texture +90° → points left; Down texture +90° → points right.
   restyleScrollButton(hUp, "RIGHT", "LEFT", math.rad(90))
-  restyleScrollButton(hDown, "LEFT", "RIGHT", math.rad(-90))
+  restyleScrollButton(hDown, "LEFT", "RIGHT", math.rad(90))
   local hThumb = hScroll:GetThumbTexture()
   if hThumb then
     hThumb:SetSize(24, 18)
