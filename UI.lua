@@ -915,22 +915,41 @@ local function buildMain()
   vScroll:SetValue(0)
   main.vScroll = vScroll
 
-  local hScroll = CreateFrame("Slider", "ArenaLogViewerHScroll", paneBg)
-  hScroll:SetHeight(16)
-  hScroll:SetPoint("BOTTOMLEFT", 6, 8)
-  hScroll:SetPoint("BOTTOMRIGHT", -28, 8)
+  -- Same Blizzard chrome as the vertical bar (UIPanelScrollBarTemplate), laid out horizontally.
+  local hScroll = CreateFrame("Slider", "ArenaLogViewerHScroll", paneBg, "UIPanelScrollBarTemplate")
   hScroll:SetOrientation("HORIZONTAL")
+  hScroll:ClearAllPoints()
+  hScroll:SetHeight(16)
+  hScroll:SetPoint("BOTTOMLEFT", 28, 10)
+  hScroll:SetPoint("BOTTOMRIGHT", -50, 10)
   hScroll:SetMinMaxValues(0, 1)
   hScroll:SetValue(0)
-  hScroll:SetValueStep(1)
-  local hTrack = hScroll:CreateTexture(nil, "BACKGROUND")
-  hTrack:SetColorTexture(0.12, 0.12, 0.14, 1)
-  hTrack:SetAllPoints()
-  local hThumb = hScroll:CreateTexture(nil, "OVERLAY")
-  hThumb:SetColorTexture(0.55, 0.55, 0.6, 1)
-  hThumb:SetSize(48, 14)
-  hScroll:SetThumbTexture(hThumb)
   main.hScroll = hScroll
+
+  local function rotateTex(tex, radians)
+    if tex and tex.SetRotation then
+      tex:SetRotation(radians)
+    end
+  end
+  local function restyleScrollButton(btn, point, relPoint, radians)
+    if not btn then return end
+    btn:ClearAllPoints()
+    btn:SetPoint(point, hScroll, relPoint, 0, 0)
+    rotateTex(btn:GetNormalTexture(), radians)
+    rotateTex(btn:GetPushedTexture(), radians)
+    rotateTex(btn:GetDisabledTexture(), radians)
+    rotateTex(btn:GetHighlightTexture(), radians)
+  end
+  local hUp = hScroll.ScrollUpButton or _G["ArenaLogViewerHScrollScrollUpButton"]
+  local hDown = hScroll.ScrollDownButton or _G["ArenaLogViewerHScrollScrollDownButton"]
+  -- ScrollUp decreases value → left; ScrollDown increases → right
+  restyleScrollButton(hUp, "RIGHT", "LEFT", math.rad(90))
+  restyleScrollButton(hDown, "LEFT", "RIGHT", math.rad(-90))
+  local hThumb = hScroll:GetThumbTexture()
+  if hThumb then
+    hThumb:SetSize(24, 18)
+    rotateTex(hThumb, math.rad(90))
+  end
 
   local syncingScroll = false
   local function syncTimelineScrollBars()
