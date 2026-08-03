@@ -246,6 +246,7 @@ local function renderTimeline(match, content, pps)
       content.emptyTrack:Show()
     end
     content:SetSize(400, 80)
+    if main and main.syncTimelineScrollBars then main.syncTimelineScrollBars() end
     return
   end
 
@@ -317,6 +318,7 @@ local function renderTimeline(match, content, pps)
   end
   hideExtraRows(#rows + 1)
   content:SetSize(trackX + trackW + 40, RULER_H + #rows * ROW_H + 20)
+  if main and main.syncTimelineScrollBars then main.syncTimelineScrollBars() end
 end
 
 local function renderCoordination(match, content)
@@ -380,6 +382,7 @@ local function renderCoordination(match, content)
   content.coordText:Show()
   if content.emptyTrack then content.emptyTrack:Hide() end
   content:SetSize(640, 200)
+  if main and main.syncTimelineScrollBars then main.syncTimelineScrollBars() end
 end
 
 local function updateStatsBar(match)
@@ -890,20 +893,96 @@ local function buildMain()
   statsBar:SetWordWrap(true)
   main.statsBar = statsBar
 
-  local pane = CreateFrame("ScrollFrame", nil, paneBg, "UIPanelScrollFrameTemplate")
+  -- Dual-axis scroll: vertical bar on the right, horizontal along the bottom.
+  local pane = CreateFrame("ScrollFrame", "ArenaLogViewerTimelineScroll", paneBg)
   pane:SetPoint("TOPLEFT", 6, -78)
-  pane:SetPoint("BOTTOMRIGHT", -28, 8)
+  pane:SetPoint("BOTTOMRIGHT", -28, 28)
+  pane:EnableMouse(true)
+  pane:EnableMouseWheel(true)
   local content = CreateFrame("Frame", nil, pane)
   content:SetSize(100, 100)
   pane:SetScrollChild(content)
   main.content = content
+  main.pane = pane
   content.emptyTrack = content:CreateFontString(nil, "OVERLAY", "GameFontDisable")
   content.emptyTrack:SetPoint("TOPLEFT", 20, -40)
   content.emptyTrack:Hide()
 
+  local vScroll = CreateFrame("Slider", "ArenaLogViewerVScroll", pane, "UIPanelScrollBarTemplate")
+  vScroll:SetPoint("TOPLEFT", pane, "TOPRIGHT", 4, -16)
+  vScroll:SetPoint("BOTTOMLEFT", pane, "BOTTOMRIGHT", 4, 16)
+  vScroll:SetMinMaxValues(0, 1)
+  vScroll:SetValue(0)
+  main.vScroll = vScroll
+
+  local hScroll = CreateFrame("Slider", "ArenaLogViewerHScroll", paneBg)
+  hScroll:SetHeight(16)
+  hScroll:SetPoint("BOTTOMLEFT", 6, 8)
+  hScroll:SetPoint("BOTTOMRIGHT", -28, 8)
+  hScroll:SetOrientation("HORIZONTAL")
+  hScroll:SetMinMaxValues(0, 1)
+  hScroll:SetValue(0)
+  hScroll:SetValueStep(1)
+  local hTrack = hScroll:CreateTexture(nil, "BACKGROUND")
+  hTrack:SetColorTexture(0.12, 0.12, 0.14, 1)
+  hTrack:SetAllPoints()
+  local hThumb = hScroll:CreateTexture(nil, "OVERLAY")
+  hThumb:SetColorTexture(0.55, 0.55, 0.6, 1)
+  hThumb:SetSize(48, 14)
+  hScroll:SetThumbTexture(hThumb)
+  main.hScroll = hScroll
+
+  local syncingScroll = false
+  local function syncTimelineScrollBars()
+    if not pane or syncingScroll then return end
+    syncingScroll = true
+    local xrange = pane:GetHorizontalScrollRange() or 0
+    local yrange = pane:GetVerticalScrollRange() or 0
+    vScroll:SetMinMaxValues(0, math.max(yrange, 0.001))
+    hScroll:SetMinMaxValues(0, math.max(xrange, 0.001))
+    local vx = math.min(pane:GetVerticalScroll() or 0, yrange)
+    local hx = math.min(pane:GetHorizontalScroll() or 0, xrange)
+    vScroll:SetValue(vx)
+    hScroll:SetValue(hx)
+    if yrange > 1 then vScroll:Show() else vScroll:Hide() end
+    if xrange > 1 then hScroll:Show() else hScroll:Hide() end
+    syncingScroll = false
+  end
+  main.syncTimelineScrollBars = syncTimelineScrollBars
+
+  vScroll:SetScript("OnValueChanged", function(_, value)
+    if syncingScroll then return end
+    pane:SetVerticalScroll(value)
+  end)
+  hScroll:SetScript("OnValueChanged", function(_, value)
+    if syncingScroll then return end
+    pane:SetHorizontalScroll(value)
+  end)
+  pane:SetScript("OnScrollRangeChanged", function()
+    syncTimelineScrollBars()
+  end)
+  pane:SetScript("OnVerticalScroll", function()
+    syncTimelineScrollBars()
+  end)
+  pane:SetScript("OnHorizontalScroll", function()
+    syncTimelineScrollBars()
+  end)
+  pane:SetScript("OnMouseWheel", function(self, delta)
+    if IsShiftKeyDown() then
+      local max = self:GetHorizontalScrollRange() or 0
+      local next = math.max(0, math.min(max, (self:GetHorizontalScroll() or 0) - delta * 80))
+      self:SetHorizontalScroll(next)
+    else
+      local max = self:GetVerticalScrollRange() or 0
+      local next = math.max(0, math.min(max, (self:GetVerticalScroll() or 0) - delta * 36))
+      self:SetVerticalScroll(next)
+    end
+    syncTimelineScrollBars()
+  end)
+
   local footerL = main:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
   footerL:SetPoint("BOTTOMLEFT", 18, 18)
-  footerL:SetText("Hover a bar → GameTooltip shows time • kind • source → target")
+  footerL:SetText("Scroll · Shift+scroll horizontal · hover bar for details")
 
   local footerR = main:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
   footerR:SetPoint("BOTTOMRIGHT", -18, 18)
