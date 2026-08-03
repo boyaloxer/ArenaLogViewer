@@ -2,7 +2,7 @@
 ## Title: Arena Log Viewer
 ## Notes: Live CLEU arena recorder + WCL-style in-game timeline (does not import disk combat logs).
 ## Author: boyaloxer
-## Version: 0.3.0
+## Version: 0.3.1
 ## SavedVariables: ArenaLogViewerDB
 
 Recorder.lua

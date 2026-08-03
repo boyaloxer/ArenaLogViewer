@@ -1,5 +1,5 @@
 -- UI.lua — in-game viewer matching the Arena Log Viewer mockup:
--- match cards, stats bar, aura pills, abbreviated timeline rows, export.
+-- match cards, stats bar, aura filter dropdown, icon+name timeline rows, export.
 
 local ADDON, NS = ...
 local PX_PER_SEC = 40
@@ -19,8 +19,9 @@ local sourceFilter, targetFilter = "all", "any"
 local hiddenAuras = {}
 local segPool, poolIdx = {}, 0
 local rowPool = {}
-local pillPool = {}
+local auraMenuRows = {}
 local cardPool = {}
+local auraFilterList = {} -- current match aura rows for the dropdown
 
 local function EnsureDB()
   ArenaLogViewerDB = ArenaLogViewerDB or {}
@@ -117,12 +118,20 @@ end
 
 local function ensureRow(content, i)
   local row = rowPool[i]
-  if row then return row end
+  if row then
+    if not row.icon then
+      row.icon = content:CreateTexture(nil, "ARTWORK")
+      row.icon:SetSize(SEG, SEG)
+      row.icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+    end
+    return row
+  end
   row = {}
   row.bg = content:CreateTexture(nil, "BACKGROUND")
   row.bg:SetHeight(ROW_H)
-  row.abbr = content:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-  row.abbr:SetJustifyH("LEFT")
+  row.icon = content:CreateTexture(nil, "ARTWORK")
+  row.icon:SetSize(SEG, SEG)
+  row.icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
   row.label = content:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
   row.label:SetJustifyH("LEFT")
   row.track = CreateFrame("Frame", nil, content)
@@ -135,7 +144,11 @@ local function hideExtraRows(fromIndex)
   for i = fromIndex, #rowPool do
     local row = rowPool[i]
     if row then
-      row.bg:Hide(); row.abbr:Hide(); row.label:Hide(); row.track:Hide()
+      row.bg:Hide()
+      if row.icon then row.icon:Hide() end
+      if row.abbr then row.abbr:Hide() end
+      row.label:Hide()
+      row.track:Hide()
     end
   end
 end
@@ -244,7 +257,6 @@ local function renderTimeline(match, content, pps)
     local row = ensureRow(content, i)
     local r, g, b = NS.SchoolColor(rowData.school)
     local tex = GetSpellTexture(rowData.spellId) or 134400
-    local abbr = NS.SpellAbbrev(rowData.spellName)
 
     row.bg:ClearAllPoints()
     row.bg:SetPoint("TOPLEFT", 0, y)
@@ -252,16 +264,15 @@ local function renderTimeline(match, content, pps)
     row.bg:SetColorTexture(i % 2 == 0 and 1 or 0, i % 2 == 0 and 1 or 0, i % 2 == 0 and 1 or 0, i % 2 == 0 and 0.03 or 0.12)
     row.bg:Show()
 
-    row.abbr:ClearAllPoints()
-    row.abbr:SetPoint("TOPLEFT", 6, y - 4)
-    row.abbr:SetWidth(28)
-    row.abbr:SetText(abbr)
-    row.abbr:SetTextColor(r, g, b)
-    row.abbr:Show()
+    if row.abbr then row.abbr:Hide() end
+    row.icon:ClearAllPoints()
+    row.icon:SetPoint("TOPLEFT", 6, y - 3)
+    row.icon:SetTexture(tex)
+    row.icon:Show()
 
     row.label:ClearAllPoints()
-    row.label:SetPoint("LEFT", row.abbr, "RIGHT", 4, 0)
-    row.label:SetWidth(LABEL_W - 40)
+    row.label:SetPoint("LEFT", row.icon, "RIGHT", 6, 0)
+    row.label:SetWidth(LABEL_W - 36)
     row.label:SetText(rowData.spellName or "?")
     row.label:SetTextColor(r, g, b)
     row.label:Show()
@@ -397,56 +408,107 @@ local function updateStatsBar(match)
   bar:SetText(table.concat(bits, "   "))
 end
 
-local function updatePills(match)
-  if not main or not main.pillRow then return end
-  for _, b in ipairs(pillPool) do b:Hide() end
-  if not match or viewMode ~= "timeline" then return end
-
+local function collectAuraRows(match)
   local seen, list = {}, {}
+  if not match then return list end
   for _, row in ipairs(match.timeline or {}) do
     local hasAura = false
     for _, s in ipairs(row.segments or {}) do
       if s.kind == "aura" then hasAura = true; break end
     end
-    if hasAura and not seen[row.spellName] then
-      seen[row.spellName] = true
+    if hasAura and not seen[row.key] then
+      seen[row.key] = true
       table.insert(list, row)
     end
   end
+  return list
+end
 
-  local x = 0
+local function ensureAuraMenuRow(i)
+  local b = auraMenuRows[i]
+  if b then return b end
+  local menu = main.auraMenu
+  b = CreateFrame("Button", nil, menu.content, "BackdropTemplate")
+  b:SetSize(220, 22)
+  b:SetBackdrop({
+    bgFile = "Interface\\Buttons\\WHITE8X8",
+    edgeFile = "Interface\\Buttons\\WHITE8X8",
+    edgeSize = 1,
+  })
+  b.icon = b:CreateTexture(nil, "ARTWORK")
+  b.icon:SetSize(16, 16)
+  b.icon:SetPoint("LEFT", 4, 0)
+  b.icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+  b.check = b:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+  b.check:SetPoint("LEFT", b.icon, "RIGHT", 4, 0)
+  b.check:SetWidth(14)
+  b.fs = b:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+  b.fs:SetPoint("LEFT", b.check, "RIGHT", 2, 0)
+  b.fs:SetPoint("RIGHT", -4, 0)
+  b.fs:SetJustifyH("LEFT")
+  auraMenuRows[i] = b
+  return b
+end
+
+local function refreshAuraMenuContents()
+  if not main or not main.auraMenu then return end
+  local list = auraFilterList
+  local hiddenN = 0
   for i, row in ipairs(list) do
-    if i > 12 then break end
-    local b = pillPool[i]
-    if not b then
-      b = CreateFrame("Button", nil, main.pillRow, "BackdropTemplate")
-      b:SetSize(110, 20)
-      b:SetBackdrop({
-        bgFile = "Interface\\Buttons\\WHITE8X8",
-        edgeFile = "Interface\\Buttons\\WHITE8X8",
-        edgeSize = 1,
-      })
-      b.fs = b:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-      b.fs:SetPoint("CENTER")
-      b.fs:SetWidth(100)
-      pillPool[i] = b
-    end
+    local b = ensureAuraMenuRow(i)
     local r, g, bl = NS.SchoolColor(row.school)
     local off = hiddenAuras[row.key]
-    b:SetBackdropColor(r * 0.25, g * 0.25, bl * 0.25, off and 0.25 or 0.85)
-    b:SetBackdropBorderColor(r, g, bl, off and 0.3 or 0.9)
-    b.fs:SetText(row.spellName)
-    b.fs:SetTextColor(r, g, bl, off and 0.4 or 1)
+    if off then hiddenN = hiddenN + 1 end
+    b:SetBackdropColor(0.08, 0.08, 0.09, 1)
+    b:SetBackdropBorderColor(r * 0.5, g * 0.5, bl * 0.5, off and 0.35 or 0.9)
+    b.icon:SetTexture(GetSpellTexture(row.spellId) or 134400)
+    b.icon:SetDesaturated(off and true or false)
+    b.check:SetText(off and "" or "✓")
+    b.check:SetTextColor(r, g, bl)
+    b.fs:SetText(row.spellName or "?")
+    b.fs:SetTextColor(r, g, bl, off and 0.45 or 1)
     b:ClearAllPoints()
-    b:SetPoint("LEFT", main.pillRow, "LEFT", x, 0)
+    b:SetPoint("TOPLEFT", 4, -(i - 1) * 24 - 4)
     b:SetScript("OnClick", function()
       if hiddenAuras[row.key] then hiddenAuras[row.key] = nil
       else hiddenAuras[row.key] = true end
       if selectedMatch then NS.RefreshViewer() end
     end)
     b:Show()
-    x = x + 114
   end
+  for i = #list + 1, #auraMenuRows do auraMenuRows[i]:Hide() end
+  main.auraMenu.content:SetHeight(math.max(40, #list * 24 + 8))
+  if main.auraBtn then
+    if #list == 0 then
+      main.auraBtn:SetText("Aura filters")
+      main.auraBtn:Disable()
+    else
+      main.auraBtn:Enable()
+      if hiddenN > 0 then
+        main.auraBtn:SetText(("Aura filters (%d hidden)"):format(hiddenN))
+      else
+        main.auraBtn:SetText(("Aura filters (%d)"):format(#list))
+      end
+    end
+  end
+end
+
+local function updateAuraFilters(match)
+  if not main or not main.auraBtn then return end
+  if main.auraMenu and viewMode ~= "timeline" then
+    main.auraMenu:Hide()
+  end
+  if not match or viewMode ~= "timeline" then
+    auraFilterList = {}
+    if main.auraBtn then
+      main.auraBtn:SetText("Aura filters")
+      main.auraBtn:Disable()
+    end
+    for _, b in ipairs(auraMenuRows) do b:Hide() end
+    return
+  end
+  auraFilterList = collectAuraRows(match)
+  refreshAuraMenuContents()
 end
 
 local function cycleFilter(which)
@@ -584,7 +646,7 @@ function NS.RefreshViewer()
   end
 
   updateStatsBar(m)
-  updatePills(m)
+  updateAuraFilters(m)
 
   if main.content and main.content.coordText then main.content.coordText:Hide() end
   if m then
@@ -780,6 +842,47 @@ local function buildMain()
   zoomLabel:SetPoint("LEFT", zoomIn, "RIGHT", 6, 0)
   main.zoomLabel = zoomLabel
 
+  local auraBtn = CreateFrame("Button", nil, paneBg, "UIPanelButtonTemplate")
+  auraBtn:SetSize(150, 20)
+  auraBtn:SetPoint("LEFT", zoomLabel, "RIGHT", 12, 0)
+  auraBtn:SetText("Aura filters")
+  auraBtn:Disable()
+  main.auraBtn = auraBtn
+
+  local auraMenu = CreateFrame("Frame", "ArenaLogViewerAuraMenu", paneBg, "BackdropTemplate")
+  auraMenu:SetSize(240, 200)
+  auraMenu:SetPoint("TOPLEFT", auraBtn, "BOTTOMLEFT", 0, -2)
+  auraMenu:SetFrameStrata("FULLSCREEN_DIALOG")
+  auraMenu:SetBackdrop({
+    bgFile = "Interface\\Buttons\\WHITE8X8",
+    edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+    edgeSize = 16,
+    insets = { left = 4, right = 4, top = 4, bottom = 4 },
+  })
+  auraMenu:SetBackdropColor(0.05, 0.05, 0.06, 0.98)
+  auraMenu:Hide()
+  auraMenu:EnableMouse(true)
+  main.auraMenu = auraMenu
+
+  local auraScroll = CreateFrame("ScrollFrame", nil, auraMenu, "UIPanelScrollFrameTemplate")
+  auraScroll:SetPoint("TOPLEFT", 8, -8)
+  auraScroll:SetPoint("BOTTOMRIGHT", -28, 8)
+  local auraContent = CreateFrame("Frame", nil, auraScroll)
+  auraContent:SetSize(200, 40)
+  auraScroll:SetScrollChild(auraContent)
+  auraMenu.content = auraContent
+
+  auraBtn:SetScript("OnClick", function()
+    if auraMenu:IsShown() then
+      auraMenu:Hide()
+    else
+      refreshAuraMenuContents()
+      local h = math.min(220, math.max(60, #auraFilterList * 24 + 24))
+      auraMenu:SetHeight(h)
+      auraMenu:Show()
+    end
+  end)
+
   local statsBar = paneBg:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
   statsBar:SetPoint("TOPLEFT", 10, -52)
   statsBar:SetPoint("TOPRIGHT", -10, -52)
@@ -787,13 +890,8 @@ local function buildMain()
   statsBar:SetWordWrap(true)
   main.statsBar = statsBar
 
-  local pillRow = CreateFrame("Frame", nil, paneBg)
-  pillRow:SetPoint("TOPLEFT", 10, -78)
-  pillRow:SetSize(800, 22)
-  main.pillRow = pillRow
-
   local pane = CreateFrame("ScrollFrame", nil, paneBg, "UIPanelScrollFrameTemplate")
-  pane:SetPoint("TOPLEFT", 6, -108)
+  pane:SetPoint("TOPLEFT", 6, -78)
   pane:SetPoint("BOTTOMRIGHT", -28, 8)
   local content = CreateFrame("Frame", nil, pane)
   content:SetSize(100, 100)
@@ -843,6 +941,9 @@ local function buildMain()
     EnsureDB()
     selectedMatch = nil
     NS.RefreshViewer()
+  end)
+  main:SetScript("OnHide", function()
+    if main.auraMenu then main.auraMenu:Hide() end
   end)
 end
 
